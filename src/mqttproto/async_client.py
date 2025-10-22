@@ -259,6 +259,9 @@ class AsyncMQTTClient:
     will: Will | None = field(
         kw_only=True, default=None, validator=optional(instance_of(Will))
     )
+    stamina_kwargs: dict[str, Any] = field(
+        kw_only=True, default_factory=dict, validator=instance_of(dict)
+    )
 
     _exit_stack: AsyncExitStack = field(init=False)
     _closed: bool = field(init=False, default=False)
@@ -415,7 +418,9 @@ class AsyncMQTTClient:
         stream: ByteStream
         assert self.host_or_path
         ssl_context = self.ssl if isinstance(self.ssl, SSLContext) else None
-        for attempt in stamina.retry_context(on=(OSError, SSLError)):
+        for attempt in stamina.retry_context(
+            on=(OSError, SSLError), **self.stamina_kwargs
+        ):
             with attempt:
                 if self.transport == "unix":
                     stream = await connect_unix(self.host_or_path)
@@ -450,7 +455,9 @@ class AsyncMQTTClient:
         # MQTT-6.0.0-3
         async with AsyncExitStack() as exit_stack:
             client = await exit_stack.enter_async_context(AsyncClient(verify=self.ssl))
-            for attempt in stamina.retry_context(on=(OSError, SSLError)):
+            for attempt in stamina.retry_context(
+                on=(OSError, SSLError), **self.stamina_kwargs
+            ):
                 with attempt:
                     session = await exit_stack.enter_async_context(
                         aconnect_ws(uri, client=client, subprotocols=["mqtt"])
