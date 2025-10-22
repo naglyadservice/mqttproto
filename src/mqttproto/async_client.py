@@ -259,8 +259,8 @@ class AsyncMQTTClient:
     will: Will | None = field(
         kw_only=True, default=None, validator=optional(instance_of(Will))
     )
-    stamina_kwargs: dict[str, Any] = field(
-        kw_only=True, default_factory=dict, validator=instance_of(dict)
+    stamina_kwargs: dict[str, Any] | None = field(
+        kw_only=True, default_factory=None, validator=instance_of(dict)
     )
 
     _exit_stack: AsyncExitStack = field(init=False)
@@ -419,7 +419,7 @@ class AsyncMQTTClient:
         assert self.host_or_path
         ssl_context = self.ssl if isinstance(self.ssl, SSLContext) else None
         for attempt in stamina.retry_context(
-            on=(OSError, SSLError), **self.stamina_kwargs
+            on=(OSError, SSLError), **(self.stamina_kwargs or {})
         ):
             with attempt:
                 if self.transport == "unix":
@@ -456,7 +456,7 @@ class AsyncMQTTClient:
         async with AsyncExitStack() as exit_stack:
             client = await exit_stack.enter_async_context(AsyncClient(verify=self.ssl))
             for attempt in stamina.retry_context(
-                on=(OSError, SSLError), **self.stamina_kwargs
+                on=(OSError, SSLError), **(self.stamina_kwargs or {})
             ):
                 with attempt:
                     session = await exit_stack.enter_async_context(
