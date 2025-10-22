@@ -260,7 +260,7 @@ class AsyncMQTTClient:
         kw_only=True, default=None, validator=optional(instance_of(Will))
     )
     stamina_kwargs: dict[str, Any] | None = field(
-        kw_only=True, default_factory=None, validator=instance_of(dict)
+        kw_only=True, default=None, validator=instance_of(dict)
     )
 
     _exit_stack: AsyncExitStack = field(init=False)
