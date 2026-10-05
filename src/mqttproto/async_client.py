@@ -19,6 +19,7 @@ from anyio import (
     connect_unix,
     create_memory_object_stream,
     create_task_group,
+    move_on_after,
 )
 from anyio.abc import ByteReceiveStream, ByteStream, TaskStatus
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -26,6 +27,7 @@ from anyio.streams.tls import TLSStream
 from attr.validators import ge, gt, in_, instance_of, le, lt, optional
 from attrs import define, field
 
+from ._base_client_state_machine import MQTTClientState
 from ._exceptions import (
     MQTTConnectFailed,
     MQTTOperationFailed,
@@ -72,6 +74,11 @@ TAckPacket = TypeVar(
     None,
 )
 TOperationException = TypeVar("TOperationException", bound=MQTTOperationFailed)
+
+#: PINGREQ goes out every ``keep_alive * KEEP_ALIVE_PING_FRACTION`` seconds. The spec
+#: (MQTT-3.1.2-22) lets the broker drop a client silent for 1.5 x keep_alive; pinging
+#: well inside keep_alive itself keeps the client compliant despite scheduling jitter.
+KEEP_ALIVE_PING_FRACTION = 0.75
 
 
 class MQTTWebsocketStream(ByteStream):
@@ -227,6 +234,9 @@ class AsyncMQTTClient:
     :param will: message that will be published by the broker on the client's behalf if
         the client disconnects unexpectedly or fails to communicate within the keepalive
         time
+    :param keep_alive: keep alive interval in seconds sent in ``CONNECT``; when non-zero
+        the client sends ``PINGREQ`` on its own so that the broker keeps a live session
+        and drops a dead one after 1.5 x this value (``0`` disables keep alive)
     """
 
     host_or_path: str | None = field(default=None, validator=optional(instance_of(str)))
@@ -261,6 +271,9 @@ class AsyncMQTTClient:
     )
     stamina_kwargs: dict[str, Any] | None = field(
         kw_only=True, default=None, validator=instance_of(dict)
+    )
+    keep_alive: int = field(
+        kw_only=True, default=0, validator=[instance_of(int), ge(0), le(65535)]
     )
 
     _exit_stack: AsyncExitStack = field(init=False)
@@ -338,13 +351,17 @@ class AsyncMQTTClient:
                 self._stream = stream
 
                 # Start handling inbound packets
+                connection_lost = Event()
                 task_group = await exit_stack.enter_async_context(create_task_group())
                 task_group.start_soon(
-                    self._read_inbound_packets, stream, ignored_exc_classes
+                    self._read_until_lost, stream, ignored_exc_classes, connection_lost
                 )
 
                 # Perform the MQTT handshake (send conn + receive connack)
                 await self._do_handshake()
+
+                if self.keep_alive:
+                    task_group.start_soon(self._send_pings, connection_lost)
 
                 # Signal that the client is ready
                 if not task_status_sent:
@@ -356,6 +373,7 @@ class AsyncMQTTClient:
             username=self.username,
             password=self.password,
             will=self.will,
+            keep_alive=self.keep_alive,
         )
         operation = MQTTConnectOperation()
         await self._run_operation(operation)
@@ -366,6 +384,39 @@ class AsyncMQTTClient:
         ):
             assert isinstance(client_id, str)
             self.client_id = client_id
+
+    async def _read_until_lost(
+        self,
+        stream: ByteReceiveStream,
+        exception_classes: tuple[type[Exception]],
+        connection_lost: Event,
+    ) -> None:
+        try:
+            await self._read_inbound_packets(stream, exception_classes)
+        finally:
+            connection_lost.set()
+
+    async def _send_pings(self, connection_lost: Event) -> None:
+        # Lives exactly as long as one transport connection: returns as soon as the
+        # reader sees the stream end, so the reconnect loop is never held up by it.
+        interval = self.keep_alive * KEEP_ALIVE_PING_FRACTION
+        while not connection_lost.is_set():
+            with move_on_after(interval):
+                await connection_lost.wait()
+
+            if connection_lost.is_set():
+                return
+
+            # A graceful disconnect in progress leaves the session CONNECTING or
+            # DISCONNECTED; the stream closes right after, which ends this loop.
+            if self._state_machine.state is not MQTTClientState.CONNECTED:
+                continue
+
+            self._state_machine.ping()
+            try:
+                await self._flush_outbound_data()
+            except (BrokenResourceError, ClosedResourceError):
+                return
 
     async def _read_inbound_packets(
         self, stream: ByteReceiveStream, exception_classes: tuple[type[Exception]]
